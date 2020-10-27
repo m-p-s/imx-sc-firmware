@@ -70,6 +70,7 @@
 #include "drivers/drc/fsl_drc_cbt.h"
 #include "drivers/drc/fsl_drc_derate.h"
 #include "drivers/drc/fsl_drc_rdbi_deskew.h"
+#include "drivers/drc/fsl_drc_dram_vref.h"
 #include "pads.h"
 #include "drivers/pad/fsl_pad.h"
 #include "dcd/dcd_retention.h"
@@ -367,6 +368,8 @@ board_parm_rtn_t board_parameter(board_parm_t parm)
         case BOARD_PARM_DC0_PLL1_SSC:
             rtn = BOARD_PARM_RTN_NOT_USED;
             break;
+        case BOARD_PARM_KS1_WDOG_WAKE:
+            rtn = BOARD_PARM_KS1_WDOG_WAKE_ENABLE;
         case BOARD_PARM_DC1_PLL0_SSC:
             rtn = BOARD_PARM_RTN_NOT_USED;
             break;
@@ -403,6 +406,15 @@ sc_bool_t board_rsrc_avail(sc_rsrc_t rsrc)
     /* Note return values are usually static. Can be made dynamic by storing
        return in a global variable and setting using board_set_control() */
 
+    if(rsrc == SC_R_PMIC_1)
+    {
+        rtn = SC_FALSE;
+    }
+    if(rsrc == SC_R_PMIC_2)
+    {
+        rtn = SC_FALSE;
+    }
+
     return rtn;
 }
 
@@ -414,13 +426,13 @@ sc_err_t board_init_ddr(sc_bool_t early, sc_bool_t ddr_initialized)
     /*
      * Variables for DDR retention
      */
-    #ifdef BD_DDR_RET
+    #if defined(BD_DDR_RET) & !defined(SKIP_DDR)
         /* Storage for DRC registers */
         static ddrc board_ddr_ret_drc_inst[BD_DDR_RET_NUM_DRC];
-        
+
         /* Storage for DRC PHY registers */
         static ddr_phy board_ddr_ret_drc_phy_inst[BD_DDR_RET_NUM_DRC];
-        
+
         /* Storage for DDR regions */
         static uint32_t board_ddr_ret_buf1[BD_DDR_RET_REGION1_SIZE];
         #ifdef BD_DDR_RET_REGION2_SIZE
@@ -468,6 +480,13 @@ sc_err_t board_init_ddr(sc_bool_t early, sc_bool_t ddr_initialized)
         };
     #endif
 
+    #if defined(BD_LPDDR4_INC_DQS2DQ) && defined(BOARD_DQS2DQ_SYNC)
+        static soc_dqs2dq_sync_info_t board_dqs2dq_sync_info =
+        {
+            BOARD_DQS2DQ_ISI_RSRC, BOARD_DQS2DQ_ISI_REG, BOARD_DQS2DQ_SYNC_TIME
+        };
+    #endif
+
     board_print(3, "board_init_ddr(%d)\n", early);
 
     #ifdef SKIP_DDR
@@ -489,21 +508,25 @@ sc_err_t board_init_ddr(sc_bool_t early, sc_bool_t ddr_initialized)
 
         #ifdef DEBUG_BOARD
             uint32_t rate = 0U;
+            sc_err_t rate_err = SC_ERR_FAIL;
             if (rm_is_resource_avail(SC_R_DRC_0))
             {
-                (void) pm_get_clock_rate(SC_PT, SC_R_DRC_0, SC_PM_CLK_MISC0,
-                    &rate);
+                rate_err = pm_get_clock_rate(SC_PT, SC_R_DRC_0,
+                    SC_PM_CLK_SLV_BUS, &rate);
             }
             else if (rm_is_resource_avail(SC_R_DRC_1))
             {
-                (void) pm_get_clock_rate(SC_PT, SC_R_DRC_1, SC_PM_CLK_MISC0,
+                rate_err = pm_get_clock_rate(SC_PT, SC_R_DRC_1, SC_PM_CLK_MISC0,
                     &rate);
             }
             else
             {
                 ; /* Intentional empty else */
             }
-            board_print(1, "DDR frequency = %u\n", rate * 2U);
+	    if (rate_err == SC_ERR_NONE)
+	    {
+            	board_print(1, "DDR frequency = %u\n", rate * 2U);
+	    }
         #endif
 
         if (err == SC_ERR_NONE)
@@ -513,6 +536,9 @@ sc_err_t board_init_ddr(sc_bool_t early, sc_bool_t ddr_initialized)
             #endif
 
             #ifdef BD_LPDDR4_INC_DQS2DQ
+            #ifdef BOARD_DQS2DQ_SYNC
+                soc_ddr_dqs2dq_config(&board_dqs2dq_sync_info);
+            #endif
                 if (board_ddr_period_ms != 0U)
                 {
                     soc_ddr_dqs2dq_init();
@@ -526,7 +552,6 @@ sc_err_t board_init_ddr(sc_bool_t early, sc_bool_t ddr_initialized)
         return err;
     #endif
 }
-
 
 /*--------------------------------------------------------------------------*/
 /* Take action on DDR                                                       */
@@ -731,6 +756,15 @@ sc_err_t  board_ddr_config(bool rom_caller, board_ddr_action_t action)
             }
             break;
     #endif
+        case BOARD_DDR0_VREF:
+            #if defined(MONITOR) || defined(EXPORT_MONITOR)
+                // Launch VREF training
+                DRAM_VREF_training_hw(0);
+            #else
+                // Run vref training
+                DRAM_VREF_training_sw(0);
+            #endif
+            break;
         default:
             board_dcd_config();
             break;
@@ -742,10 +776,10 @@ sc_err_t  board_ddr_config(bool rom_caller, board_ddr_action_t action)
 /*--------------------------------------------------------------------------*/
 /* Configure the system (inc. additional resource partitions)               */
 /*--------------------------------------------------------------------------*/
-sc_err_t board_system_config(sc_bool_t early, sc_rm_pt_t pt_boot)
+void board_system_config(sc_bool_t early, sc_rm_pt_t pt_boot)
 {
     sc_err_t err = SC_ERR_NONE;
-    
+
     /* This function configures the system. It usually partitions
        resources according to the system design. It must be modified by
        customers. Partitions should then be specified using the mkimage
@@ -755,17 +789,27 @@ sc_err_t board_system_config(sc_bool_t early, sc_rm_pt_t pt_boot)
 
     sc_bool_t alt_config = SC_FALSE;
     sc_bool_t no_ap = SC_FALSE;
-    
+
     /* Get boot parameters. See the Boot Flags section for defintition
        of these flags.*/
-    (void) boot_get_data(NULL, NULL, NULL, NULL, NULL, NULL, &alt_config,
+    boot_get_data(NULL, NULL, NULL, NULL, NULL, NULL, &alt_config,
         NULL, NULL, &no_ap);
 
     board_print(3, "board_system_config(%d, %d)\n", early, alt_config);
 
+#ifndef EMUL
+    sc_rm_mr_t mr_temp;
+
+    /* Board has 3GB memory so fragment upper region and retain 1GB */
+    BRD_ERR(rm_memreg_frag(pt_boot, &mr_temp, 0x8C0000000ULL,
+        0xFFFFFFFFFULL));
+    BRD_ERR(rm_memreg_free(pt_boot, mr_temp));
+#endif
+
     /* Configure initial resource allocation (note additional allocation
        and assignments can be made by the SCFW clients at run-time */
-    if (alt_config != SC_FALSE)
+    if ((alt_config != SC_FALSE) 
+        && (rm_is_resource_avail(SC_R_M4_0_PID0) != SC_FALSE))
     {
         sc_rm_pt_t pt_m4_0;
         sc_rm_pt_t pt_m4_1;
@@ -978,12 +1022,6 @@ sc_err_t board_system_config(sc_bool_t early, sc_rm_pt_t pt_boot)
             rm_dump(pt_boot);
         #endif
     }
-    else
-    {
-        err = SC_ERR_UNAVAILABLE;
-    }
-
-    return err;
 }
 
 /*--------------------------------------------------------------------------*/
@@ -1019,6 +1057,7 @@ void board_set_power_mode(sc_sub_t ss, uint8_t pd,
     /* Check for PMIC */
     if (pmic_ver.device_id != 0U)
     {
+        sc_err_t err = SC_ERR_NONE;
         uint8_t mode;
 
         if (pmic_ver.device_id == PF100_DEV_ID)
@@ -1037,8 +1076,8 @@ void board_set_power_mode(sc_sub_t ss, uint8_t pd,
 
             while (idx < num_regs)
             {
-                (void) PMIC_SET_MODE(pmic_id[idx], pmic_reg[idx],
-                    mode);
+                BRD_ERR(PMIC_SET_MODE(pmic_id[idx], pmic_reg[idx],
+                    mode));
                 idx++;
             }
             SystemTimeDelay(PMIC_MAX_RAMP);
@@ -1050,12 +1089,19 @@ void board_set_power_mode(sc_sub_t ss, uint8_t pd,
             mode = 0U;
             while (idx < num_regs)
             {
-                (void) PMIC_SET_MODE(pmic_id[idx], pmic_reg[idx],
-                    mode);
+                BRD_ERR(PMIC_SET_MODE(pmic_id[idx], pmic_reg[idx],
+                    mode));
                 idx++;
             }
         }
     }
+}
+
+/*--------------------------------------------------------------------------*/
+/* Set board power supplies when enter/exit low-power mode                  */
+/*--------------------------------------------------------------------------*/
+void board_lpm(sc_pm_power_mode_t mode)
+{
 }
 
 /*--------------------------------------------------------------------------*/
@@ -1094,8 +1140,8 @@ sc_err_t board_set_voltage(sc_sub_t ss, uint32_t new_volt, uint32_t old_volt)
 
         while (idx < num_regs)
         {
-            (void) PMIC_SET_VOLTAGE(pmic_id[idx], pmic_reg[idx], new_volt,
-                mode);
+            BRD_ERR(PMIC_SET_VOLTAGE(pmic_id[idx], pmic_reg[idx], new_volt,
+                mode));
             idx++;
         }
         if ((old_volt != 0U) && (new_volt > old_volt))
@@ -1113,29 +1159,24 @@ sc_err_t board_set_voltage(sc_sub_t ss, uint32_t new_volt, uint32_t old_volt)
 /*--------------------------------------------------------------------------*/
 /* Reset a board resource                                                   */
 /*--------------------------------------------------------------------------*/
-void board_rsrc_reset(sc_rm_idx_t idx, sc_rm_idx_t rsrc_idx)
+void board_rsrc_reset(sc_rm_idx_t idx, sc_rm_idx_t rsrc_idx, sc_rm_pt_t pt)
 {
 }
 
 /*--------------------------------------------------------------------------*/
 /* Transition external board-level supply for board component               */
 /*--------------------------------------------------------------------------*/
-sc_err_t board_trans_resource_power(sc_rm_idx_t idx, sc_rm_idx_t rsrc_idx,
+void board_trans_resource_power(sc_rm_idx_t idx, sc_rm_idx_t rsrc_idx,
     sc_pm_power_mode_t from_mode, sc_pm_power_mode_t to_mode)
 {
-    sc_err_t err = SC_ERR_NONE;
-    
-    board_print(3, "board_trans_resource_power(%d, %s, %u, %u)\n", idx, 
+    board_print(3, "board_trans_resource_power(%d, %s, %u, %u)\n", idx,
         rnames[rsrc_idx], from_mode, to_mode);
 
     /* Init PMIC */
     pmic_init();
 
-    /* Check if PMIC available */
-    ASRT_ERR(pmic_ver.device_id != 0U, SC_ERR_NOTFOUND);
-
     /* Process resource */
-    if (err == SC_ERR_NONE)
+    if (pmic_ver.device_id != 0U)
     {
         switch (idx)
         {
@@ -1224,12 +1265,10 @@ sc_err_t board_trans_resource_power(sc_rm_idx_t idx, sc_rm_idx_t rsrc_idx,
                     from_mode, to_mode);
                 break;
             default :
-                err = SC_ERR_PARM;
+                ; /* Intentional empty default */
                 break;
         }
     }
-
-    return err;
 }
 
 /*--------------------------------------------------------------------------*/
@@ -1325,19 +1364,19 @@ void board_cpu_reset(sc_rsrc_t resource, board_cpu_rst_ev_t reset_event,
 {
     /* Note:  Production code should decide the response for each type
      *        of reset event.  Options include allowing the SCFW to
-     *        reset the CPU or forcing a full system reset.  Additionally, 
-     *        the number of reset attempts can be tracked to determine the 
+     *        reset the CPU or forcing a full system reset.  Additionally,
+     *        the number of reset attempts can be tracked to determine the
      *        reset response.
      */
-    
+
     /* Check for M4 reset event */
     if ((resource == SC_R_M4_0_PID0) || (resource == SC_R_M4_1_PID0))
     {
-        always_print("CM4 reset event (rsrc = %d, event = %d)\n", resource, 
+        always_print("CM4 reset event (rsrc = %d, event = %d)\n", resource,
             reset_event);
 
         /* Treat lockups or parity/ECC reset events as board faults */
-        if ((reset_event == BOARD_CPU_RESET_LOCKUP) || 
+        if ((reset_event == BOARD_CPU_RESET_LOCKUP) ||
             (reset_event == BOARD_CPU_RESET_MEM_ERR))
         {
             board_fault(SC_FALSE, BOARD_BFAULT_CPU, pt);
@@ -1388,10 +1427,11 @@ board_reboot_to_t board_reboot_timeout(sc_rm_pt_t pt)
 /*--------------------------------------------------------------------------*/
 void board_panic(sc_dsc_t dsc)
 {
+    /* See Porting Guide for more info on panic alarms */
     #ifdef DEBUG
         error_print("Panic temp (dsc=%d)\n", dsc);
     #endif
-    
+
     (void) board_reset(SC_PM_RESET_TYPE_BOARD, SC_PM_RESET_REASON_TEMP,
         SC_PT);
 }
@@ -1410,6 +1450,8 @@ void board_fault(sc_bool_t restarted, sc_bfault_t reason,
         WDOG32_Unlock(WDOG_SC);
         WDOG32_SetTimeoutValue(WDOG_SC, 0xFFFF);
         WDOG32_Disable(WDOG_SC);
+
+        board_print(1, "board fault(%u, %u, %u)\n", restarted, reason, pt);
 
         /* Stop so developer can see WDOG occurred */
         HALT;
@@ -1451,7 +1493,7 @@ sc_err_t board_set_control(sc_rsrc_t resource, sc_rm_idx_t idx,
     sc_rm_idx_t rsrc_idx, uint32_t ctrl, uint32_t val)
 {
     sc_err_t err = SC_ERR_NONE;
-    
+
     board_print(3,
         "board_set_control(%s, %u, %u)\n", rnames[rsrc_idx], ctrl, val);
 
@@ -1534,7 +1576,7 @@ sc_err_t board_get_control(sc_rsrc_t resource, sc_rm_idx_t idx,
     sc_rm_idx_t rsrc_idx, uint32_t ctrl, uint32_t *val)
 {
     sc_err_t err = SC_ERR_NONE;
-    
+
     board_print(3,
         "board_get_control(%s, %u)\n", rnames[rsrc_idx], ctrl);
 
@@ -1558,7 +1600,13 @@ sc_err_t board_get_control(sc_rsrc_t resource, sc_rm_idx_t idx,
                 {
                     *val = temp_alarm0;
                 }
-                else
+                else if (ctrl == SC_C_ID)
+                {
+                    pmic_version_t v = GET_PMIC_VERSION(PMIC_0_ADDR);
+
+                    *val = (U32(v.device_id) << 8U) | U32(v.si_rev);
+                }
+		else
                 {
                     err = SC_ERR_PARM;
                 }
@@ -1720,7 +1768,7 @@ static void pmic_init(void)
                 SC_PM_PW_MODE_ON);
             (void) pm_set_clock_rate(SC_PT, SC_R_SC_I2C,
                 SC_PM_CLK_PER, &rate);
-            (void) pm_force_clock_enable(SC_R_SC_I2C, SC_PM_CLK_PER,
+            pm_force_clock_enable(SC_R_SC_I2C, SC_PM_CLK_PER,
                 SC_TRUE);
 
             /* Initialize the pads used to communicate with the PMIC */
@@ -1760,9 +1808,9 @@ static void pmic_init(void)
                 temp_alarm1 = SET_PMIC_TEMP_ALARM(PMIC_1_ADDR, PMIC_TEMP_MAX);
                 temp_alarm2 = SET_PMIC_TEMP_ALARM(PMIC_2_ADDR, PMIC_TEMP_MAX);
 
-                (void) PMIC_SET_MODE(PMIC_0_ADDR, SW1AB, SW_MODE_PWM_STBY_PWM);
-                (void) PMIC_SET_MODE(PMIC_0_ADDR, SW1C, SW_MODE_PWM_STBY_PWM);
-                (void) PMIC_SET_MODE(PMIC_2_ADDR, SW3A, SW_MODE_PWM_STBY_PWM);
+                BRD_ERR(PMIC_SET_MODE(PMIC_0_ADDR, SW1AB, SW_MODE_PWM_STBY_PWM));
+                BRD_ERR(PMIC_SET_MODE(PMIC_0_ADDR, SW1C, SW_MODE_PWM_STBY_PWM));
+                BRD_ERR(PMIC_SET_MODE(PMIC_2_ADDR, SW3A, SW_MODE_PWM_STBY_PWM));
             }
             /* Isolate Device Family to support 8100 & 8200 */
             else if ((pmic_get_device_id(PMIC_1_ADDR) & FAM_ID_MASK) == PF8X00_FAM_ID)
@@ -1794,17 +1842,17 @@ static void pmic_init(void)
                         | SW_STBY_PWM);
                 }
 
-		(void) PMIC_SET_VOLTAGE(PMIC_0_ADDR, PF8100_LDO3, 1800, REG_RUN_MODE);
-		(void) PMIC_SET_MODE(PMIC_0_ADDR, PF8100_LDO3, RUN_EN_STBY_OFF);
+		BRD_ERR(PMIC_SET_VOLTAGE(PMIC_0_ADDR, PF8100_LDO3, 1800, REG_RUN_MODE));
+		BRD_ERR(PMIC_SET_MODE(PMIC_0_ADDR, PF8100_LDO3, RUN_EN_STBY_OFF));
 
-		(void) PMIC_SET_VOLTAGE(PMIC_0_ADDR, PF8100_LDO4, 3300, REG_RUN_MODE);
-		(void) PMIC_SET_MODE(PMIC_0_ADDR, PF8100_LDO4, RUN_EN_STBY_OFF);
+		BRD_ERR(PMIC_SET_VOLTAGE(PMIC_0_ADDR, PF8100_LDO4, 3300, REG_RUN_MODE));
+		BRD_ERR(PMIC_SET_MODE(PMIC_0_ADDR, PF8100_LDO4, RUN_EN_STBY_OFF));
 
-		(void) PMIC_SET_VOLTAGE(PMIC_1_ADDR, PF8100_LDO1, 3300, REG_RUN_MODE);
-		(void) PMIC_SET_MODE(PMIC_1_ADDR, PF8100_LDO1, RUN_EN_STBY_OFF);
+		BRD_ERR(PMIC_SET_VOLTAGE(PMIC_1_ADDR, PF8100_LDO1, 3300, REG_RUN_MODE));
+		BRD_ERR(PMIC_SET_MODE(PMIC_1_ADDR, PF8100_LDO1, RUN_EN_STBY_OFF));
 
-		(void) PMIC_SET_VOLTAGE(PMIC_1_ADDR, PF8100_LDO2, 1800, REG_RUN_MODE);
-		(void) PMIC_SET_MODE(PMIC_1_ADDR, PF8100_LDO2, RUN_EN_STBY_OFF);
+		BRD_ERR(PMIC_SET_VOLTAGE(PMIC_1_ADDR, PF8100_LDO2, 1800, REG_RUN_MODE));
+		BRD_ERR(PMIC_SET_MODE(PMIC_1_ADDR, PF8100_LDO2, RUN_EN_STBY_OFF));
 
                 if (err != SC_ERR_NONE)
                 {
@@ -1821,7 +1869,7 @@ static void pmic_init(void)
                 /* Configure STBY voltage for SW1 (VDD_MAIN) */
                 if (board_parameter(BOARD_PARM_KS1_RETENTION) == BOARD_PARM_KS1_RETENTION_ENABLE)
                 {
-                    (void) PMIC_SET_VOLTAGE(PMIC_0_ADDR, PF8100_SW1, 800, REG_STBY_MODE);
+                    BRD_ERR(PMIC_SET_VOLTAGE(PMIC_0_ADDR, PF8100_SW1, 800, REG_STBY_MODE));
                 }
             }
             /* Isolate Device Family to support 8100 & 8200 */

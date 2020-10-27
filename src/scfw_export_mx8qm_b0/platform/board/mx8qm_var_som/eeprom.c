@@ -49,7 +49,7 @@ void eeprom_i2c_init(void)
 /*--------------------------------------------------------------------------*/
 /* Write to the EEPROM via the I2C                                            */
 /*--------------------------------------------------------------------------*/
-static status_t eeprom_i2c_write_sub(uint8_t device_addr, uint8_t reg, const void *data,
+static status_t eeprom_i2c_write_sub(uint8_t device_addr, uint8_t reg, void *data,
                               uint32_t dataLength)
 { 
     status_t status = I32(kStatus_Success);
@@ -97,7 +97,7 @@ static status_t eeprom_i2c_write_sub(uint8_t device_addr, uint8_t reg, const voi
 /*--------------------------------------------------------------------------*/
 /* Write to the EEPROM via the I2C (with clock management)                    */
 /*--------------------------------------------------------------------------*/
-status_t eeprom_i2c_write(uint8_t device_addr, uint8_t reg, const void *data, uint32_t dataLength)
+status_t eeprom_i2c_write(uint8_t device_addr, uint8_t reg, void *data, uint32_t dataLength)
 {
 #ifdef SC_MANAGE_LPI2C_CLK
     /* Enable clocking using LPCG */
