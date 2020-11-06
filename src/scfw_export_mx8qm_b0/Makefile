@@ -138,9 +138,7 @@ UPPER_C := $(shell echo $(C) | tr a-z A-Z)
 export C LOWER_C UPPER_C
 
 # Configure debug
-ifdef d
-    D := $(d)
-endif
+    D := 1
 ifndef D
     D = 1
 endif
